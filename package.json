@@ -1,0 +1,32 @@
+{
+  "name": "dsh-ck3-modcheck",
+  "version": "0.1.0",
+  "description": "Crusader Kings III mod validator for DeepSeek Harness: checks mod layout, both .mod files, path existence and ASCII-safety, localization BOM/header/entry shape and script brace balance, against rules taken from the vanilla install and the CK3 Wiki.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "cordis-plugin",
+    "client-mod",
+    "ck3",
+    "crusader-kings-3",
+    "mod",
+    "validator",
+    "linter"
+  ],
+  "type": "module",
+  "private": true,
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./lib/index.js": "./lib/index.js",
+    "./lib/rules.mjs": "./lib/rules.mjs",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "node test/falsify.mjs"
+  },
+  "license": "MIT"
+}
