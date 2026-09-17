@@ -47,7 +47,7 @@ import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
-import { Config, DEFAULTS, applyFixes, renderReport, sortFindings } from '../lib/index.js'
+import { Config, DEFAULTS, TOOLS_META, applyFixes, closingCaveat, renderReport, sortFindings } from '../lib/index.js'
 import {
   CODES,
   SEVERITY,
@@ -71,6 +71,9 @@ import {
   clearVanillaKeyCache,
   collectFiles,
   compareLauncherToDisk,
+  compareLauncherToDiskFiles,
+  describeLogRun,
+  listLauncherModFiles,
   readLauncherState,
   scaffoldMod,
   decodeText,
@@ -80,8 +83,10 @@ import {
   parseEventLog,
   parseLogLine,
   planFixes,
+  probeLauncherDatabases,
   readDeclaredThemes,
   readRuntimeEvidence,
+  selectLauncherCandidate,
   splitLines,
   validateMod,
 } from '../lib/rules.mjs'
@@ -1582,6 +1587,301 @@ async function main() {
       'no message claims the engine rejects anything — "vanilla never uses it" is the whole claim',
     )
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * The launcher database is CHOSEN, not assumed
+ * ------------------------------------------------------------------ */
+
+/*
+ * Measured on this machine before any of this existed: `launcher-v2.sqlite` held **0** mods while
+ * `launcher-v2_openbeta.sqlite` — the file the launcher is actually writing — held **7**, and the
+ * tool reported "no registered mods" plus "no launcher/disk disagreement" while the game's own log
+ * listed all seven. The choice is therefore asserted here rather than left to a hardcoded filename.
+ */
+{
+  const candidate = (file, modCount, mtimeMs, extra = {}) => ({
+    file,
+    path: 'X:\\' + file,
+    bytes: 4096,
+    mtimeMs,
+    modCount,
+    playsetModCount: modCount,
+    playsetIsActive: modCount > 0,
+    unreadable: null,
+    ...extra,
+  })
+  const emptyButNewer = candidate('launcher-v2.sqlite', 0, 3000, { playsetIsActive: null })
+  const fullAndNewest = candidate('launcher-v2_openbeta.sqlite', 7, 2000)
+  const backup = candidate('launcher-v2_openbeta-backup.sqlite', 3, 1000)
+  const chosen = selectLauncherCandidate([emptyButNewer, fullAndNewest, backup])
+  check(
+    'selectLauncherCandidate: a database WITH registered mods wins over a newer empty one',
+    chosen.chosen !== null && chosen.chosen.file === 'launcher-v2_openbeta.sqlite',
+    `chose ${chosen.chosen?.file} — the bug this guards against read ${emptyButNewer.file} (0 mods) and reported "no mods registered"`,
+  )
+  check(
+    'selectLauncherCandidate: two databases with mods are ranked by mtime, and the loser says so',
+    chosen.others.find((o) => o.file === 'launcher-v2_openbeta-backup.sqlite')?.reason === 'older than the chosen database',
+    chosen.others.map((o) => `${o.file}=${o.reason}`).join('; '),
+  )
+  check(
+    'selectLauncherCandidate: the passed-over databases are reported WITH a reason',
+    chosen.others.length === 2
+      && chosen.others.every((o) => typeof o.reason === 'string' && o.reason.length > 0)
+      && chosen.others.find((o) => o.file === 'launcher-v2.sqlite')?.reason === 'no registered mods',
+    chosen.others.map((o) => `${o.file}=${o.reason}`).join('; '),
+  )
+  check(
+    'selectLauncherCandidate: the choice does not depend on input order',
+    selectLauncherCandidate([backup, emptyButNewer, fullAndNewest]).chosen?.file === chosen.chosen?.file,
+    'same winner from a permuted list',
+  )
+  /*
+   * The comparator used to be a chain of pairwise booleans (`if (a.hasMods !== b.hasMods) …`) with
+   * mtime as one of the steps, which is not guaranteed to be a total order — and `Array.prototype.sort`
+   * made by such a comparator can land on different winners for different input orderings. The
+   * replacement compares a rank RECORD as a whole. This fixture is the real shape: the file the
+   * launcher is actually writing holds the most mods (a `-backup` is thinner by construction) while
+   * the stable name is empty and newest. The assertion demands one winner across all six orderings
+   * AND that the winner is the rich database — a "newest wins" rule would answer with the empty file.
+   */
+  const adversarial = [
+    candidate('launcher-v2.sqlite', 0, 3000, { playsetIsActive: null }),
+    candidate('launcher-v2_openbeta.sqlite', 7, 2000),
+    candidate('launcher-v2_openbeta-backup.sqlite', 3, 1000),
+  ]
+  const winners = new Set()
+  for (const permutation of [
+    [0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0],
+  ]) {
+    winners.add(selectLauncherCandidate(permutation.map((i) => adversarial[i])).chosen?.file)
+  }
+  check(
+    'selectLauncherCandidate: a total order — all six input orderings agree, and the database with the most mods wins',
+    winners.size === 1 && [...winners][0] === 'launcher-v2_openbeta.sqlite',
+    `winners: ${[...winners].join(', ')} — a "newest file wins" comparator picks the ${adversarial[0].file} here, which is the whole defect`,
+  )
+  const allEmpty = selectLauncherCandidate([
+    candidate('launcher-v2.sqlite', 0, 3000, { playsetIsActive: null }),
+    candidate('launcher-v2_openbeta.sqlite', 0, 5000, { playsetIsActive: null }),
+  ])
+  check(
+    'selectLauncherCandidate: with every database empty, the newest still wins',
+    allEmpty.chosen?.file === 'launcher-v2_openbeta.sqlite',
+    `chose ${allEmpty.chosen?.file}`,
+  )
+  const unreadable = selectLauncherCandidate([
+    candidate('launcher-v2_openbeta.sqlite', 0, 9000, { unreadable: 'file is not a database' }),
+    candidate('launcher-v2.sqlite', 0, 1000, { playsetIsActive: null }),
+  ])
+  check(
+    'selectLauncherCandidate: an unreadable database loses even when it is newest, and says why',
+    unreadable.chosen?.file === 'launcher-v2.sqlite'
+      && unreadable.others[0]?.reason?.startsWith('unreadable:'),
+    `chose ${unreadable.chosen?.file}; reason ${unreadable.others[0]?.reason}`,
+  )
+  check(
+    'selectLauncherCandidate: no candidates is a state, not a throw',
+    selectLauncherCandidate([]).chosen === null && selectLauncherCandidate([]).others.length === 0,
+    'empty input -> { chosen: null, others: [] }',
+  )
+
+  const launcherFixtureDir = path.join(root, 'launcher-fixture')
+  await put(path.join(launcherFixtureDir, 'mod', 'a.mod'), 'name="a"\n')
+  await put(path.join(launcherFixtureDir, 'mod', 'b.mod'), 'name="b"\n')
+  await put(path.join(launcherFixtureDir, 'mod', 'notes.txt'), 'not a mod\n')
+  const listed = await listLauncherModFiles(launcherFixtureDir)
+  check(
+    'listLauncherModFiles: only .mod names come back, sorted',
+    listed.length === 2 && listed[0] === 'a.mod' && listed[1] === 'b.mod',
+    `got [${listed.join(', ')}]`,
+  )
+  check(
+    'listLauncherModFiles: a directory that does not exist returns [] rather than throwing',
+    (await listLauncherModFiles(path.join(root, 'no-such-launcher-dir'))).length === 0,
+    '[]',
+  )
+
+  const available = { available: true, mods: [{ gameRegistryId: 'mod/a.mod', displayName: 'a' }] }
+  const unregistered = compareLauncherToDiskFiles(available, ['a.mod', 'b.mod'], path.join(launcherFixtureDir, 'mod'))
+  check(
+    'launcher-mod-unregistered: a .mod the registry does not name IS reported, with the on-disk one left alone',
+    unregistered.length === 1
+      && unregistered[0].code === 'launcher-mod-unregistered'
+      && unregistered[0].severity === 'warn'
+      && unregistered[0].file.endsWith('b.mod'),
+    `got [${unregistered.map((f) => f.file.split(path.sep).pop()).join(', ')}]`,
+  )
+  check(
+    'launcher-mod-unregistered: registered-but-differently-cased names still count as registered',
+    compareLauncherToDiskFiles({ available: true, mods: [{ gameRegistryId: 'mod/A.MOD' }] }, ['a.mod'], '').length === 0,
+    'case-insensitive matching, because Windows filenames are',
+  )
+  check(
+    'launcher-mod-unregistered: an unavailable database reports NOTHING (absence must not look like a defect)',
+    compareLauncherToDiskFiles({ available: false, mods: [] }, ['a.mod', 'b.mod'], '').length === 0,
+    'the contract falsify.mjs:1025 already described is now actually exercised',
+  )
+  check(
+    'launcher-mod-unregistered: a registry with no gameRegistryId columns does not condemn every file',
+    compareLauncherToDiskFiles({ available: true, mods: [{ displayName: 'x' }, {}] }, ['a.mod'], '').length === 1,
+    'one file, one finding: a missing id is not a match for anything',
+  )
+  check(
+    'launcher-mod-unregistered: a non-.mod file name is never reported',
+    compareLauncherToDiskFiles(available, ['notes.txt'], '').length === 0,
+    'only .mod names are candidates',
+  )
+}
+
+/* ------------------------------------------------------------------ *
+ * The runtime evidence plane: run identity, and shell lines with continuations
+ * ------------------------------------------------------------------ */
+
+/*
+ * Measured on a modded run: `error.log` held 1780 E-level lines but only 43 distinct MESSAGES,
+ * because 1562 of them were the same shell line with their real content on the following,
+ * non-timestamped lines. A deduplication key of "the message" collapsed 1621 real errors into 2 and
+ * printed the 43 as if it were an error count. These fixtures pin both halves of the fix.
+ */
+{
+  const logsFixture = path.join(root, 'logs-fixture')
+  const SHELL = 'Script system error! (while building tooltip/description)'
+  await put(path.join(logsFixture, 'error.log'), [
+    '[23:22:47][E][jomini_script_system.cpp:303]: ' + SHELL,
+    "  Error: Undefined event target 'liege'",
+    '  Script location: file: common/script_values/00_court_position_values.txt line: 779',
+    '[23:22:48][E][jomini_script_system.cpp:303]: ' + SHELL,
+    '  Error: Undefined event target liege',
+    '  Script location: file: common/script_values/00_court_position_values.txt line: 780',
+    '[23:22:49][E][jomini_script_system.cpp:303]: ' + SHELL,
+    '  Error: Undefined event target leige',
+    '  Script location: file: common/script_values/00_court_position_values.txt line: 781',
+    '[23:22:50][E][jomini_script_system.cpp:303]: ' + SHELL,
+    "  Error: Undefined event target 'liege'",
+    '  Script location: file: common/script_values/00_court_position_values.txt line: 779',
+    '',
+  ].join('\n'))
+  await put(path.join(logsFixture, 'code_revisions.log'), '[23:16:57][I][jomini_game_setup.cpp:352]: game_hash_long: 6b540d23dbb0ae5f6a2ccc155338feabbaf64bbc\n')
+  await put(path.join(logsFixture, 'system.log'), '[23:16:57][D][game_setup.cpp:82]: Exe Git Version: q2-26/fix/dlc_fix : 6b540d23d\n')
+  const evidence = await readRuntimeEvidence(logsFixture)
+  check(
+    'shell lines: three distinct faults behind one shell are three messages, not one',
+    evidence.distinctErrors.length === 3,
+    `got ${evidence.distinctErrors.length}`,
+  )
+  check(
+    'shell lines: a repeated shell+continuation pair stays ONE message with count 2',
+    evidence.distinctErrors.some((e) => e.count === 2),
+    evidence.distinctErrors.map((e) => e.count).join(','),
+  )
+  check(
+    'shell lines: the continuation text is part of the entry, not lost',
+    evidence.distinctErrors.every((e) => e.continuation.includes('Script location:')),
+    'each entry carries its `Script location:` line',
+  )
+  check(
+    'shell lines: raw lines, distinct shells and the second collapse number are all reported',
+    evidence.rawELines === 4
+      && evidence.distinctErrors.length === 3
+      && evidence.suppressedShellErrors === evidence.rawELines - evidence.distinctErrors.reduce((n, e) => n + e.count, 0),
+    `raw ${evidence.rawELines}, distinct ${evidence.distinctErrors.length}, suppressed ${evidence.suppressedShellErrors}`,
+  )
+  check(
+    'run identity: the earliest timestamp dates the run, even when it is not the first file read',
+    evidence.run?.startedAt === '23:16:57',
+    `startedAt=${evidence.run?.startedAt}`,
+  )
+  check(
+    'run identity: the install version and game hash are read from the startup lines',
+    evidence.run?.gameHash?.startsWith('6b540d23') && evidence.run?.exeVersion?.startsWith('q2-26'),
+    `${evidence.run?.gameHash} / ${evidence.run?.exeVersion}`,
+  )
+  check(
+    'an unreadable logs directory reports unavailable AND still exposes the new fields',
+    (await readRuntimeEvidence(path.join(root, 'no-such-logs'))).available === false,
+    '`available:false` shape preserved',
+  )
+  const older = describeLogRun([{ name: 'a.log', bytes: 3, text: '[23:00:00][D][x:1]: y\n', bySeverity: {} }])
+  check(
+    'describeLogRun: a single file still yields a start time',
+    older.startedAt === '23:00:00' && older.gameHash === null,
+    JSON.stringify(older),
+  )
+}
+
+/* ------------------------------------------------------------------ *
+ * Tool descriptions — the drift that nothing used to see
+ * ------------------------------------------------------------------ */
+
+/*
+ * `apply()` is never called by this suite, so when the four descriptions were inline literals not one
+ * of them could be asserted. Two drifted as a result: the evidence tool promised a reachability
+ * signal while its own output said the file it needs is never created, and the checker called the
+ * `path=` format unverified a year after the wiki settled it. The descriptions now live in
+ * TOOLS_META so they can be pinned here.
+ *
+ * These assertions deliberately encode the BINDING conditions, not the exact prose, so honest
+ * re-wording stays possible while dropping a qualifier does not.
+ */
+{
+  const names = Object.keys(TOOLS_META).sort()
+  check(
+    'tool table: exactly the four tools are described, and none of them is empty',
+    names.length === 4
+      && names.join(',') === 'ck3_mod_evidence,ck3_mod_init,ck3_mod_status,ck3_modcheck'
+      && names.every((n) => TOOLS_META[n].name === n && TOOLS_META[n].description.trim().length > 80),
+    `names: ${names.join(', ')}; the registration sites read these fields`,
+  )
+  const evidenceText = TOOLS_META.ck3_mod_evidence.description
+  check(
+    'ck3_mod_evidence description: event_log.csv is never presented as present without its unavailability',
+    !/event_log\.csv/.test(evidenceText)
+      || (/(读不到|缺能力|永不写|never|not created)/.test(evidenceText) && /(若存在|只在|当且仅当|only when|if.*write)/.test(evidenceText)),
+    'a description may raise the capability only alongside the condition under which it exists',
+  )
+  check(
+    'ck3_mod_evidence description: the per-run scope of the logs is stated',
+    /每次运行|每次启动|per run|overwritten/.test(evidenceText),
+    'the logs are rewritten by each launch, so a report must date itself',
+  )
+  check(
+    'ck3_modcheck description: the path= claim is about the launcher, not an unverified format',
+    !/format[^.]*unverified|相对 vs 绝对|relative vs absolute is unverified/i.test(TOOLS_META.ck3_modcheck.description)
+      && /launcher/i.test(TOOLS_META.ck3_modcheck.description),
+    'the three spellings are documented; what cannot be claimed is that the launcher accepted yours',
+  )
+  const codes = Object.values(CODES)
+  check(
+    'CODES: every code has a severity, and the table is the size the plugin claims',
+    codes.every((code) => SEVERITY[code] === 'error' || SEVERITY[code] === 'warn') && codes.length === 39,
+    `codes: ${codes.length} — 38 from the original brief plus launcher-mod-unregistered; tag-unknown was removed`,
+  )
+  check(
+    'CODES: no duplicate code strings (a copy-paste would silently shadow a check)',
+    new Set(codes).size === codes.length,
+    `${new Set(codes).size} unique of ${codes.length}`,
+  )
+  const retired = 'tag-' + 'unknown'
+  check(
+    'retired codes: tag-unknown is not produced by any check, so it cannot appear in a report',
+    !codes.includes(retired) && !Object.keys(SEVERITY).includes(retired),
+    'the tag vocabulary check was retired by measurement; nothing may resurrect it silently',
+  )
+  const caveat = closingCaveat()
+  check(
+    'the report closing caveat: the path= claim is about the launcher, not an unverified format',
+    !/unverified here/i.test(caveat) && /launcher/i.test(caveat) && /loads the mod/i.test(caveat),
+    'the same stale claim lived in two places — the tool description and this closing line',
+  )
+  const zero = renderReport({ title: 'x', modsScanned: 0, baseDir: '.', findings: [], notes: ['nothing here'] })
+  const one = renderReport({ title: 'x', modsScanned: 1, baseDir: '.', findings: [], notes: [] })
+  check(
+    'renderReport: a run that examined nothing does not print the pass sentence a clean run prints',
+    /no check ran/i.test(zero) && !/no check ran/i.test(one) && /every check that ran passed/i.test(one),
+    'measured: a missing modDir printed "No findings: every check that ran passed" over an empty directory',
+  )
 }
 
 /* ------------------------------------------------------------------ *
